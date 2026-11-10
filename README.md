@@ -1,5 +1,7 @@
 # hurubase
 
+[![CI](https://github.com/wegweg7979/hurunagus-rebase/actions/workflows/ci.yml/badge.svg)](https://github.com/wegweg7979/hurunagus-rebase/actions/workflows/ci.yml)
+
 A safe rebase helper for [hurunagus](https://github.com/wegweg7979) images and
 other atomic Fedora/bootc distros.
 
@@ -82,6 +84,10 @@ asking. Proceeds past a refusal.
 test/hurubase-test.sh    # 103 checks; fake rpm-ostree/bootc/skopeo/systemctl/df,
                          # a fixture /etc, $HOME and /etc/skel — nothing real is touched
 ```
+
+GitHub Actions runs the same suite on `ubuntu-24.04`, plus `bash -n`, shellcheck
+(warning and up) on both scripts, the executable bit and shebang, and a check
+that this README lists every target `--list` knows about.
 
 Every environment seam (fixtures, command paths, dry-run, root gate) is
 documented in the header of `hurubase`.

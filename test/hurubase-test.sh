@@ -25,12 +25,10 @@ FAILED_NAMES=()
 
 t() {
   CURRENT=$1
-  t_failed=0
 }
 ok() { PASS=$((PASS + 1)); }
 bad() {
   FAIL=$((FAIL + 1))
-  t_failed=1
   printf 'FAIL  %s\n      %s\n' "$CURRENT" "$1"
   [[ " ${FAILED_NAMES[*]} " == *" $CURRENT "* ]] || FAILED_NAMES+=("$CURRENT")
 }
@@ -47,7 +45,7 @@ assert_content() { [[ -r $1 && $(cat "$1") == "$2" ]] && ok || bad "expected $1 
 assert_is_link() { [[ -L $1 && $(readlink "$1") == "$2" ]] && ok || bad "expected symlink $1 -> $2"; }
 assert_glob_count() {
   local pat=$1 want=$2 n
-  n=$(find $(dirname "$pat") -maxdepth 1 -name "$(basename "$pat")" 2>/dev/null | wc -l)
+  n=$(find "$(dirname "$pat")" -maxdepth 1 -name "$(basename "$pat")" 2>/dev/null | wc -l)
   [[ $n == "$want" ]] && ok || bad "expected $want matches for $pat, got $n"
 }
 assert_logged() {

@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint (syntax, shellcheck, metadata)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: bash -n syntax
+        run: |
+          bash -n hurubase
+          bash -n test/hurubase-test.sh
+
+      - name: shellcheck
+        run: |
+          # shellcheck ships in the runner image; install it if that ever changes.
+          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y shellcheck; }
+          shellcheck --version | sed -n '3p'
+          # Severity: warning and up. Style-level rules fight the deliberate
+          # `${VAR:-}` defaults, the quoted globs in the adoption pass, and the
+          # fixture files this repository is built out of.
+          shellcheck -S warning hurubase test/hurubase-test.sh
+
+      - name: executable bit and shebang survive a clone
+        run: |
+          test -x hurubase || { echo "::error file=hurubase::hurubase must stay executable in git"; exit 1; }
+          head -n1 hurubase | grep -qx '#!/usr/bin/env bash' ||
+            { echo "::error file=hurubase::expected the bash shebang, got: $(head -n1 hurubase)"; exit 1; }
+
+      - name: README target table matches --list
+        run: |
+          set -euo pipefail
+          rc=0
+          # Table region only: everything before the first blank line, minus the header row.
+          while read -r name _; do
+            [[ -n $name ]] || continue
+            pat=$(printf '`%s`' "$name")
+            grep -qF "$pat" README.md ||
+              { echo "::error file=README.md::README does not list the target '$name'"; rc=1; }
+          done < <(./hurubase --list | sed -n '1,/^$/p' | tail -n +2)
+          exit "$rc"
+
+      - name: the CLI answers without a system to inspect
+        run: |
+          ./hurubase --version
+          ./hurubase --help >/dev/null
+          ./hurubase --list >/dev/null
+
+  test:
+    name: test suite (fully sandboxed)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: test/hurubase-test.sh
+        run: test/hurubase-test.sh

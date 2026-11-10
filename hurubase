@@ -104,7 +104,6 @@ WARNINGS=()
 REFUSALS=()
 NOTES=()
 BACKUPS=()
-STEP_DONE=0
 COMMAND=""
 APPLY_CMD=()
 
@@ -336,6 +335,7 @@ os_release_value() {
   [[ -r $OS_RELEASE ]] || return 0
   (
     set +u
+    # shellcheck source=/dev/null
     . "$OS_RELEASE" >/dev/null 2>&1 || exit 0
     case "$key" in
     ID) printf '%s' "${ID:-}" ;;
@@ -493,7 +493,7 @@ secure_boot_state() {
 # target inspection (no pull: registry metadata only)
 # --------------------------------------------------------------------------- #
 
-T_DIGEST=""; T_VERSION=""; T_CREATED=""; T_LABELS=""
+T_DIGEST=""; T_VERSION=""; T_CREATED=""
 
 inspect_target() {
   local ref=$1 out
@@ -517,9 +517,9 @@ lab = d.get("Labels") or {}
 print("|".join([str(d.get("Digest") or ""),
                 str(lab.get("org.opencontainers.image.version") or ""),
                 str(lab.get("org.opencontainers.image.created") or ""),
-                ",".join(sorted(lab.keys()))]))
+                ""]))
 ' <<<"$out")
-  IFS='|' read -r T_DIGEST T_VERSION T_CREATED T_LABELS <<<"$parsed"
+  IFS='|' read -r T_DIGEST T_VERSION T_CREATED _T_LABELS <<<"$parsed"
   return 0
 }
 
@@ -1149,10 +1149,10 @@ main() {
     --yes | -y) ASSUME_YES=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --force) FORCE=1 ;;
-    --continue) COMMAND=continue ;;
-    --finish) COMMAND=finish ;;
-    --status) COMMAND=status ;;
-    --rollback) COMMAND=rollback ;;
+    --continue) COMMAND="continue" ;;
+    --finish) COMMAND="finish" ;;
+    --status) COMMAND="status" ;;
+    --rollback) COMMAND="rollback" ;;
     --adopt-differs) ADOPT_DIFFERS=1 ;;
     --no-adopt) ADOPT=0 ;;
     --fix-session) FIX_SESSION=1 ;;
