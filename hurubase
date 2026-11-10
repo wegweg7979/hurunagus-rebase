@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # hurubase — safe rebase helper for hurunagus images and other atomic Fedora/bootc distros.
 #
-#   hurubase --list                          list known rebase targets
-#   hurubase <target> [--check] [--yes]      preflight, plan, then apply (asks first)
-#   hurubase --image <ref> [...]             same, for an arbitrary image reference
-#   hurubase --continue                      run the second half of a two-step rebase
-#   hurubase --finish [--adopt-differs] [--fix-session]
+#   hurubase <image-reference> [--check]     preflight, plan, then apply (asks first)
+#   hurubase <image-reference>               run the SAME command again after each reboot:
+#                                            it completes the two-step rebase, then walks the
+#                                            post-rebase fixes and asks before each one
+#   hurubase --list                          the images whose desktop this tool knows
 #   hurubase --status                        what state are we in?
 #   hurubase --rollback [--yes]              go back to the previous deployment
+#
+# The target is ALWAYS a container image address, for example
+#   ghcr.io/wegweg7979/hurunagus-hyprland:latest
+# A bare name is not accepted: the address is what gets resolved, pinned by
+# digest, and rebased onto. --list prints the addresses whose desktop and
+# display manager this tool already knows about (those get the extra warnings,
+# the session name and the never-clobber list).
 #
 # Rebasing between images that ship a different desktop environment or display
 # manager is not just "rpm-ostree rebase && reboot". The things that actually
@@ -63,7 +70,8 @@
 #   HURUBASE_BOOTC_JSON      fixture for `bootc status --json`
 #   HURUBASE_SKOPEO_JSON     fixture for `skopeo inspect --no-tags docker://<ref>`
 #   HURUBASE_EUID            override EUID (root gate)
-#   HURUBASE_ASSUME_YES=1    skip the confirmation prompt
+#   HURUBASE_ANSWERS         file of y/n answers, consumed one per prompt (scripted prompts)
+#   HURUBASE_ASSUME_YES=1    skip the confirmation prompt (answers yes to everything)
 #   HURUBASE_DRY_RUN=1       print the commands instead of running them
 #   HURUBASE_TTY             /dev/tty
 #   HURUBASE_BOOT_PART / HURUBASE_VAR_PART / HURUBASE_MIN_FREE_{VAR,BOOT}_MB
@@ -106,6 +114,9 @@ NOTES=()
 BACKUPS=()
 COMMAND=""
 APPLY_CMD=()
+ANSWERS_FILE=${HURUBASE_ANSWERS:-}
+ANSWER_INDEX=0
+TARGET_REF=""
 
 # --------------------------------------------------------------------------- #
 # output
@@ -143,6 +154,17 @@ run() {
 confirm() {
   local prompt=$1 answer
   [[ $ASSUME_YES == 1 ]] && { info "auto-confirmed (--yes)"; return 0; }
+  if [[ -n $ANSWERS_FILE ]]; then
+    [[ -r $ANSWERS_FILE ]] || { err "HURUBASE_ANSWERS is unreadable: $ANSWERS_FILE"; return 1; }
+    ANSWER_INDEX=$((ANSWER_INDEX + 1))
+    answer=$(sed -n "${ANSWER_INDEX}p" "$ANSWERS_FILE" 2>/dev/null) || answer=""
+    if [[ $answer =~ ^[[:space:]]*[yY] ]]; then
+      info "answered yes (HURUBASE_ANSWERS line $ANSWER_INDEX)"
+      return 0
+    fi
+    info "answered no (HURUBASE_ANSWERS line $ANSWER_INDEX)"
+    return 1
+  fi
   if [[ ! -e $TTY_DEV ]]; then
     err "no terminal available for confirmation; re-run with --yes if you mean it"
     return 1
@@ -274,6 +296,14 @@ variant_load() {
   return 0
 }
 
+variant_refs() {
+  local n
+  while read -r n; do
+    variant_load "$n" || continue
+    printf '%s\n' "$V_REF"
+  done < <(variant_names)
+}
+
 variant_list() {
   printf '%-22s %-18s %-9s %-11s %s\n' TARGET DESKTOP DM APPLY IMAGE
   local n
@@ -283,8 +313,40 @@ variant_list() {
     [[ $n == hurunagus-hyprland ]] && mark="[flagship]"
     printf '%-22s %-18s %-9s %-11s %s %s\n' "$n" "$V_DE" "$V_DM" "$V_APPLY" "$V_REF" "$mark"
   done < <(variant_names)
-  printf '\n%sTargets are chosen by name; use --image <ref> for anything else.%s\n' "$C_DIM" "$C_RESET"
+  printf '\n%sPass the address itself, e.g. %sghcr.io/wegweg7979/hurunagus-hyprland:latest%s\n' "$C_DIM" "$C_BOLD" "$C_RESET"
   printf '%sUnsupported by design: any *-nvidia* image (refused), and the retired\nhurunagus, hurunagus-umbriel and hurunagus-hyprland-dms images.%s\n' "$C_DIM" "$C_RESET"
+}
+
+# Sets V_* from an image reference: exact address first, then by repository,
+# otherwise generic defaults. Always returns 0.
+load_target_from_ref() {
+  local ref=$1
+  if find_variant_by_ref "$ref"; then return 0; fi
+  V_NAME=$(normalize_ref "$ref")
+  V_DE="unknown"
+  V_DM="unknown"
+  V_SESSION=""
+  V_APPLY="rpm-ostree"
+  V_DESC="unknown image (not one whose desktop this tool knows)"
+  V_NOTES=""
+  V_KEEP=""
+  add_warning "this address is not one this tool knows: its desktop and display manager are unknown, so there are no desktop-specific warnings, no session name to check, and no never-clobber list. The apply path is decided from the local policy alone."
+  return 0
+}
+
+# Returns 0 and sets V_* when the address (or its repository) is a known row.
+find_variant_by_ref() {
+  local want=$1 n
+  want=$(normalize_ref "$want")
+  for n in $(variant_names); do
+    variant_load "$n" || continue
+    [[ $(normalize_ref "$V_REF") == "$want" ]] && return 0
+  done
+  for n in $(variant_names); do
+    variant_load "$n" || continue
+    [[ $(repo_of_ref "$V_REF") == "$(repo_of_ref "$want")" ]] && return 0
+  done
+  return 1
 }
 
 # --------------------------------------------------------------------------- #
@@ -739,11 +801,11 @@ print_findings() {
     for i in "${NOTES[@]}"; do info "$i"; done
     if [[ $APPLY_MODE == two-step ]]; then
       info "step 1  ${APPLY_CMD[*]}"
-      info "step 2  reboot, then '$PROG --continue' (signed rebase)"
-      info "step 3  reboot, then '$PROG --finish' (adopt the new desktop's /etc/skel)"
+      info "step 2  reboot, then run the same command again: '$PROG ${TARGET_REF:-<address>}'  (signed rebase)"
+      info "step 3  reboot again, then the same command again            (fix checklist, one prompt per fix)"
     else
       info "step 1  ${APPLY_CMD[*]}"
-      info "step 2  reboot, then '$PROG --finish' (adopt the new desktop's /etc/skel)"
+      info "step 2  reboot, then run the same command again: '$PROG ${TARGET_REF:-<address>}'  (fix checklist)"
     fi
     info "rollback '$PROG --rollback' (the previous deployment is never pruned by this tool)"
   fi
@@ -815,28 +877,33 @@ do_apply() {
   if [[ $APPLY_MODE == two-step ]]; then
     state_write 1 "$ref"
     head2 "Next"
-    info "reboot, then run '$PROG --continue' to install the signed target."
+    info "reboot, then run the same command again to install the signed target:"
+    info "  $PROG ${TARGET_REF:-$ref}"
   else
     state_write 2 "$ref"
     head2 "Next"
-    info "reboot, then run '$PROG --finish' to adopt the new desktop's /etc/skel."
+    info "reboot, then run the same command again to run the fix checklist:"
+    info "  $PROG ${TARGET_REF:-$ref}"
   fi
 }
 
 cmd_continue() {
   local want_ref want_digest step booted_n
-  state_get target >/dev/null 2>&1 || die "no rebase in progress (no $(state_file)); start one with '$PROG <target>'."
+  state_get ref >/dev/null 2>&1 || die "no rebase in progress (no $(state_file)); start one with '$PROG <image-reference>'."
   step=$(state_get step || true)
   want_ref=$(state_get ref || true)
   want_digest=$(state_get digest || true)
-  variant_load "$(state_get target)" || die "the recorded target is no longer in the table"
+  load_target_from_ref "$want_ref"
   load_deployments
   booted_n=$(normalize_ref "$BOOTED_REF")
   if [[ $booted_n != "$want_ref" ]]; then
     die "the booted deployment is '$booted_n', not the rebase target '$want_ref' — reboot into it first (or run '$PROG --status')."
   fi
   case "$step" in
-  2) say "Already on the target with the signed image applied. Run '$PROG --finish'."; return 0 ;;
+  2)
+    say "Already on the target, with the signed image applied."
+    return 2
+    ;;
   1) ;;
   *) die "unexpected state: step=$step" ;;
   esac
@@ -861,7 +928,7 @@ cmd_continue() {
   fi
   state_write 2 "$want_ref"
   head2 "Next"
-  info "reboot, then run '$PROG --finish'."
+  info "reboot, then run the same command again: '$PROG $want_ref'"
 }
 
 # --------------------------------------------------------------------------- #
@@ -872,8 +939,20 @@ ADOPT_DIFFERS=0
 FIX_SESSION=0
 ADOPT=1
 
+act() {
+  [[ ${SKEL_MODE:-apply} == apply ]] && run "$@" || true
+  return 0
+}
+
+# Classifies the target's /etc/skel payload against $HOME and, in apply mode,
+# writes it. Modes: plan (report only, never touches disk) | apply.
+# missing -> write, identical -> nothing, differs -> report (or, with
+# ADOPT_DIFFERS=1, back up then write), never-clobber list -> always left alone.
 adopt_skel() {
-  local skel=$1 home=$2 created=0 same=0 differs=0 kept=0 skipped=0 rel src dst target dir
+  local skel=$1 home=$2 mode=${3:-apply}
+  local created=0 same=0 differs=0 kept=0 skipped=0 rel src dst target dir keep k acted left
+  local missing_eg="" differ_eg="" kept_eg=""
+  SKEL_MODE=$mode
   [[ -d $skel ]] || { warn "$skel does not exist; nothing to adopt."; return 0; }
   [[ -d $home ]] || die "the target home '$home' does not exist."
 
@@ -881,11 +960,11 @@ adopt_skel() {
     case "$rel" in
     /* | *..*)
       skipped=$((skipped + 1))
-      warn "skipping '$rel' (unsafe path)"
+      [[ $mode == apply ]] && warn "skipping '$rel' (unsafe path)"
       continue
       ;;
     esac
-    local keep=0 k
+    keep=0
     if [[ -n ${V_KEEP:-} ]]; then
       while IFS= read -r k; do
         [[ -n $k && $rel == "$k" ]] && keep=1
@@ -893,7 +972,7 @@ adopt_skel() {
     fi
     if ((keep)); then
       kept=$((kept + 1))
-      info "kept (never-clobber): ~/$rel"
+      ((kept <= 3)) && kept_eg+="$rel "
       continue
     fi
     src="$skel/$rel"
@@ -905,54 +984,67 @@ adopt_skel() {
           same=$((same + 1))
         else
           differs=$((differs + 1))
-          info "differs (symlink target): ~/$rel"
+          ((differs <= 3)) && differ_eg+="$rel "
         fi
       elif [[ -e $dst ]]; then
         differs=$((differs + 1))
-        info "differs (a real file already exists): ~/$rel"
+        ((differs <= 3)) && differ_eg+="$rel "
       else
-        dir=${dst%/*}
-        [[ $dir == "$dst" ]] && dir=$home
-        run mkdir -p "$dir"
-        run ln -s "$target" "$dst"
         created=$((created + 1))
-        info "created symlink: ~/$rel -> $target"
+        ((created <= 3)) && missing_eg+="$rel "
+        if [[ $mode == apply ]]; then
+          dir=${dst%/*}
+          [[ $dir == "$dst" ]] && dir=$home
+          act mkdir -p "$dir"
+          act ln -s "$target" "$dst"
+          info "created symlink: ~/$rel -> $target"
+        fi
       fi
       continue
     fi
     if [[ -d $src ]]; then
       if [[ ! -e $dst ]]; then
-        run mkdir -p "$dst"
-        created=$((created + 1))
+        act mkdir -p "$dst"
+        [[ $mode == apply ]] && info "created directory: ~/$rel"
       fi
       continue
     fi
     if [[ ! -e $dst && ! -L $dst ]]; then
-      dir=${dst%/*}
-      [[ $dir == "$dst" ]] && dir=$home
-      run mkdir -p "$dir"
-      run cp -a "$src" "$dst"
       created=$((created + 1))
-      info "created: ~/$rel"
+      ((created <= 3)) && missing_eg+="$rel "
+      if [[ $mode == apply ]]; then
+        dir=${dst%/*}
+        [[ $dir == "$dst" ]] && dir=$home
+        act mkdir -p "$dir"
+        act cp -a "$src" "$dst"
+        info "created: ~/$rel"
+      fi
     elif cmp -s "$src" "$dst" 2>/dev/null; then
       same=$((same + 1))
     else
       differs=$((differs + 1))
-      if [[ $ADOPT_DIFFERS == 1 ]]; then
+      ((differs <= 3)) && differ_eg+="$rel "
+      if [[ $mode == apply && $ADOPT_DIFFERS == 1 ]]; then
         backup_file "$dst"
-        run cp -a "$src" "$dst"
+        act cp -a "$src" "$dst"
         info "replaced (backed up): ~/$rel"
-      else
-        info "differs, left alone: ~/$rel"
       fi
     fi
   done < <(cd "$skel" && find . -mindepth 1 2>/dev/null | sed 's|^\./||' | sort)
 
-  head2 "Adoption"
-  info "created $created, already identical $same, differs $differs, never-clobber $kept, skipped $skipped"
-  if ((differs > 0)) && [[ $ADOPT_DIFFERS == 0 ]]; then
-    info "the differing files are your own settings; re-run with --adopt-differs to back them up and take the target's copies."
+  SKEL_MISSING=$created SKEL_SAME=$same SKEL_DIFFER=$differs SKEL_KEPT=$kept SKEL_SKIPPED=$skipped
+  SKEL_MISSING_EG=$missing_eg SKEL_DIFFER_EG=$differ_eg SKEL_KEPT_EG=$kept_eg
+  if [[ $mode == apply ]]; then
+    acted=$created
+    left=$differs
+    if [[ $ADOPT_DIFFERS == 1 ]]; then
+      acted=$((created + differs))
+      left=0
+    fi
+    head2 "Adoption"
+    info "wrote $acted, already identical $SKEL_SAME, left alone (differ) $left, never-clobber $kept, skipped $skipped"
   fi
+  return 0
 }
 
 backup_file() {
@@ -1001,46 +1093,161 @@ fix_session() {
   fi
 }
 
-cmd_finish() {
-  local want_ref want_step booted_n home
-  want_ref=$(state_get ref || true)
-  want_step=$(state_get step || true)
+stale_session_records() {
+  local want=$1 rec picked
+  while IFS= read -r rec; do
+    [[ -n $rec ]] || continue
+    picked=${rec##*Session=}
+    [[ -n $want && $picked == "$want" ]] && continue
+    printf '%s\n' "$rec"
+  done < <(recorded_sessions)
+}
+
+unit_exists() { have "$SYSTEMCTL" && "$SYSTEMCTL" cat "$1" >/dev/null 2>&1; }
+systemctl_user_ok() { [[ -n ${XDG_RUNTIME_DIR:-} && -S ${XDG_RUNTIME_DIR}/bus ]]; }
+
+# The post-reboot half: check the running target and offer each fix, one prompt
+# at a time. Nothing is changed without a yes; nothing is ever deleted.
+fix_checklist() {
+  local home rec session cur_dm u alias_target pending_root=0 stale=""
+  home=$(target_home)
+  session=$V_SESSION
   load_deployments
-  booted_n=$(normalize_ref "$BOOTED_REF")
-  if [[ -n $want_ref && $booted_n != "$want_ref" ]]; then
-    die "the booted deployment is '$booted_n', not the recorded target '$want_ref' — run '$PROG --status', or start over with '$PROG <target>'."
-  fi
-  if [[ -z $want_ref ]]; then
-    warn "no rebase state on this system; adopting /etc/skel based on the name you give, not on a recorded target."
-    [[ -n ${FINISH_TARGET:-} ]] || die "pass a target name ('$PROG --finish <target>') or start a rebase first."
-    variant_load "$FINISH_TARGET" || die "unknown target: $FINISH_TARGET"
+
+  head2 "Running target"
+  info "distro      $(os_release_value NAME) $(os_release_value VERSION_ID)"
+  info "deployment  $BOOTED_REF ${BOOTED_VERSION:+($BOOTED_VERSION)}"
+  cur_dm=$(dm_current)
+  info "display-mgr $cur_dm"
+  info "sessions    $(current_sessions)"
+
+  head2 "Checks"
+
+  # 1. the /etc/skel payload the rebase could not seed into an existing $HOME
+  if [[ $ADOPT == 1 ]]; then
+    adopt_skel "$SKEL" "$home" plan
+    if ((SKEL_MISSING > 0)); then
+      info "missing from $home: $SKEL_MISSING file(s) the target ships (e.g. ${SKEL_MISSING_EG%, })"
+      if confirm "Write those $SKEL_MISSING file(s) into $home?"; then
+        adopt_skel "$SKEL" "$home" apply
+      else
+        info "left alone"
+      fi
+    else
+      info "$home already has every file the target ships through /etc/skel"
+    fi
+    if ((SKEL_DIFFER > 0)); then
+      info "yours and different from the target: $SKEL_DIFFER file(s) (e.g. ${SKEL_DIFFER_EG%, })"
+      if confirm "Back each one up as <file>.pre-rebase-<timestamp> and take the target's copy?"; then
+        ADOPT_DIFFERS=1
+        adopt_skel "$SKEL" "$home" apply
+      else
+        info "kept your versions"
+      fi
+    fi
+    ((SKEL_KEPT > 0)) && info "never-clobber, always left alone: ${SKEL_KEPT_EG%, }"
+    ((SKEL_SKIPPED > 0)) && info "skipped $SKEL_SKIPPED unsafe path(s)"
   else
-    variant_load "$(state_get target)" || die "the recorded target is no longer in the table"
+    info "skipped --no-adopt: nothing in $home was changed"
   fi
 
-  home=$(target_home)
-  if [[ $ADOPT == 1 ]]; then
-    adopt_skel "$SKEL" "$home"
+  # 2. the recorded session, which still names the old desktop's session
+  if [[ -n $session ]]; then
+    while IFS= read -r rec; do stale+="$rec"$'\n'; done < <(stale_session_records "$session")
+    if [[ -n $stale ]]; then
+      info "recorded session does not match '$session':"
+      while IFS= read -r rec; do [[ -n $rec ]] && info "  $rec"; done <<<"$stale"
+      if am_root; then
+        if [[ $FIX_SESSION == 1 ]] || confirm "Reset those records to '$session' (with backups)?"; then
+          fix_session
+        fi
+      else
+        pending_root=1
+        info "rewriting /var/lib/AccountsService needs root — re-run this same command with sudo to apply it"
+      fi
+    elif [[ -r $ACCOUNTS_DIR ]]; then
+      info "recorded session already matches '$session'"
+    else
+      info "cannot read $ACCOUNTS_DIR without root, so the recorded session is unknown; re-run with sudo to check it"
+    fi
   else
-    head2 "Adoption"
-    info "skipped (--no-adopt): nothing in $home was changed."
+    info "this image does not name a session, so the recorded session cannot be checked"
   fi
-  if [[ $FIX_SESSION == 1 ]]; then
-    fix_session
-  else
-    local rec
-    head2 "Session / display manager"
-    info "display-manager.service -> $(dm_current)"
-    info "sessions available: $(current_sessions)"
-    while read -r rec; do [[ -n $rec ]] && info "recorded: $rec"; done < <(recorded_sessions)
-    info "if login lands on a black screen or bounces back, the recorded session is stale:"
-    info "  sudo $PROG --finish --fix-session   (resets it to '${V_SESSION:-<target default>}')"
+
+  # 3. display managers the target does not ship, still enabled in /etc
+  if [[ -n $V_DM && $V_DM != unknown ]]; then
+    for u in $(dm_enabled_units); do
+      [[ $u == "$V_DM" ]] && continue
+      if unit_exists "$u"; then
+        info "$u.service is enabled and still installed here; left alone (pick your session at the greeter)"
+      else
+        info "$u.service is still enabled in /etc but the target does not ship it"
+        if am_root; then
+          if confirm "Disable $u.service?"; then run "$SYSTEMCTL" disable "$u.service"; fi
+        else
+          pending_root=1
+          info "disabling it needs root — re-run this same command with sudo"
+        fi
+      fi
+    done
+    alias_target=""
+    if [[ -L $ETC/systemd/system/display-manager.service ]]; then
+      alias_target=$(readlink "$ETC/systemd/system/display-manager.service" 2>/dev/null || true)
+      if [[ -n $alias_target && ! -e $alias_target ]]; then
+        info "display-manager.service points at $alias_target, which no longer exists"
+        if am_root; then
+          if confirm "Repoint it at ${V_DM}.service?"; then run "$SYSTEMCTL" enable "$V_DM.service"; fi
+        else
+          pending_root=1
+          info "repointing it needs root — re-run this same command with sudo"
+        fi
+      fi
+    fi
   fi
+
+  # 4. user-level dotfile services the target ships
+  for u in chezmoi-init.service chezmoi-update.timer; do
+    unit_exists "$u" || continue
+    info "the target ships $u, which manages \$HOME dotfiles on login"
+    if systemctl_user_ok; then
+      if confirm "Mask $u for your user?"; then run "$SYSTEMCTL" --user mask "$u"; fi
+    else
+      info "mask it from your own session: systemctl --user mask $u"
+    fi
+  done
+
+  # 5. what the target changes about the machine, for information
   if [[ -n $V_NOTES ]]; then
     head2 "Target notes"
-    local i
-    while IFS= read -r i; do [[ -n $i ]] && info "$i"; done <<<"$V_NOTES"
+    while IFS= read -r u; do [[ -n $u ]] && info "$u"; done <<<"$V_NOTES"
   fi
+
+  if ((pending_root)); then
+    head2 "Next"
+    info "re-run this same command with sudo to apply the root-only fixes above:"
+    info "  sudo $PROG ${TARGET_REF:-$BOOTED_REF}"
+  fi
+  return 0
+}
+
+cmd_finish() {
+  local want_ref booted_n
+  want_ref=$(state_get ref || true)
+  if [[ -n ${TARGET_REF:-} ]]; then
+    load_target_from_ref "$TARGET_REF"
+    [[ -n $want_ref ]] || want_ref=$TARGET_REF
+  elif [[ -n $want_ref ]]; then
+    load_target_from_ref "$want_ref"
+  else
+    die "no rebase state on this system and no address given: run '$PROG <image-reference>'"
+  fi
+  load_deployments
+  booted_n=$(normalize_ref "$BOOTED_REF")
+  if [[ $booted_n != "$want_ref" ]]; then
+    die "the booted deployment is '$booted_n', not '$want_ref' — reboot into it first, or run '$PROG --status'."
+  fi
+  TARGET_REF=$want_ref
+  fix_checklist
   if ((${#BACKUPS[@]})); then
     head2 "Backups made"
     local b
@@ -1048,10 +1255,9 @@ cmd_finish() {
   fi
   state_clear
   head2 "Done"
-  info "rebased to ${booted_n:-$want_ref} (step ${want_step:-?} complete)"
-  info "rollback any time with '$PROG --rollback'; backups above are the only $HOME changes this tool made."
+  info "rebased to $want_ref"
+  info "rollback any time with '$PROG --rollback'; the backups above are the only changes this tool made to \$HOME."
 }
-
 # --------------------------------------------------------------------------- #
 # status / rollback
 # --------------------------------------------------------------------------- #
@@ -1070,8 +1276,8 @@ cmd_status() {
     info "digest  $(state_get digest)"
     info "step    $(state_get step) (1 = unsigned applied, 2 = signed applied)"
     case "$(state_get step)" in
-    1) info "next: reboot, then '$PROG --continue'" ;;
-    2) info "next: '$PROG --finish' if you have not adopted /etc/skel yet" ;;
+    1) info "next: reboot, then run the same command again" ;;
+    2) info "next: run the same command again for the fix checklist" ;;
     esac
   else
     info "none"
@@ -1104,37 +1310,47 @@ usage() {
 $PROG $HURUBASE_VERSION — safe rebase helper for hurunagus images and other atomic Fedora/bootc distros
 
 Usage:
-  $PROG --list                          list known targets
-  $PROG <target> [options]              preflight, plan, then apply
-  $PROG --image <ref> [options]         same, for an arbitrary image reference
-  $PROG --continue                      second half of a two-step rebase (after reboot)
-  $PROG --finish [options]              after the reboot: adopt the new desktop's /etc/skel
-  $PROG --status                        current deployment and rebase state
-  $PROG --rollback                      boot the previous deployment
+  $PROG <image-reference> [options]
+
+The target is a container image address, for example:
+  $PROG ghcr.io/wegweg7979/hurunagus-hyprland:latest
+
+Run that same command again after each reboot. With no state it preflights,
+plans and applies; staged on a two-step rebase it completes it; booted on the
+target it walks the post-rebase fixes and asks before each one.
+
+  $PROG --list                  the images whose desktop this tool knows about
+  $PROG --list-refs             just those addresses, one per line (for scripts)
+  $PROG --status                current deployment and rebase state
+  $PROG --rollback [--yes]      boot the previous deployment
   $PROG --help | --version
 
 Options:
   --check                preflight and print the plan, change nothing, ask nothing
-  --yes                  skip the confirmation prompt
+  --yes                  answer yes to every prompt
   --dry-run              print the commands instead of running them
-  --image <ref>          rebase to an arbitrary image reference
   --force                continue even if the resolved digest moved since step 1
-  --adopt-differs        with --finish: back up and replace files that differ
-  --no-adopt             with --finish: skip the /etc/skel adoption entirely (session fix only)
-  --fix-session          with --finish: reset the recorded session to the target's (root)
+  --adopt-differs        replace files that differ from the target (with backups)
+  --no-adopt             never touch $HOME, even for missing files
+  --fix-session          reset the recorded session without asking (root)
   --min-free-var <MiB>   free space the preflight demands on /var (default $MIN_FREE_VAR_MB)
+  --continue             force the second half of a two-step rebase
+  --finish               force the fix checklist
 
-Targets: $(variant_names | paste -sd' ' -)
-Refused by design: any *-nvidia* image.
+Refused by design: any *-nvidia* image, and a bare name instead of an address.
 EOF
 }
 
 main() {
-  local target="" ref="" check=0
+  local ref="" check=0 have_state=0 want_ref="" want_step="" booted_n=""
   while (($#)); do
     case "$1" in
     --list | -l)
       variant_list
+      return 0
+      ;;
+    --list-refs)
+      variant_refs
       return 0
       ;;
     --help | -h)
@@ -1161,27 +1377,16 @@ main() {
       [[ ${1:-} =~ ^[0-9]+$ ]] || usage_die "--min-free-var needs a number of MiB"
       MIN_FREE_VAR_MB=$1
       ;;
-    --image)
-      shift
-      [[ -n ${1:-} ]] || usage_die "--image needs a reference"
-      ref=$1
-      ;;
     -*) usage_die "unknown option: $1" ;;
     *)
-      [[ -z $target ]] || usage_die "one target at a time (got '$target' and '$1')"
-      target=$1
+      [[ -z $ref ]] || usage_die "one image reference at a time (got '$ref' and '$1')"
+      ref=$1
       ;;
     esac
     shift
   done
 
   case "${COMMAND:-}" in
-  continue) cmd_continue; return $? ;;
-  finish)
-    FINISH_TARGET=$target
-    cmd_finish
-    return $?
-    ;;
   status)
     cmd_status
     return $?
@@ -1190,38 +1395,80 @@ main() {
     cmd_rollback
     return $?
     ;;
+  continue)
+    cmd_continue
+    return $?
+    ;;
+  finish)
+    TARGET_REF=$ref
+    cmd_finish
+    return $?
+    ;;
   esac
 
   if [[ -z $ref ]]; then
-    if [[ -z $target ]]; then
-      usage
-      return 2
-    fi
-    variant_load "$target" || die "unknown target '$target' (see '$PROG --list')"
-    ref=$V_REF
-  else
-    is_nvidia_ref "$ref" && { err "NVIDIA images are not supported by this tool: $ref"; return 1; }
-    validate_ref "$ref" || die "'$ref' does not look like an image reference (registry/owner/name[:tag])"
-    local repo
-    repo=$(repo_of_ref "$ref")
-    # Known repository: adopt its desktop/display-manager facts.
-    local n
-    for n in $(variant_names); do
-      variant_load "$n" || continue
-      [[ $(repo_of_ref "$V_REF") == "$repo" ]] && break
-    done
-    [[ $(repo_of_ref "$V_REF") == "$repo" ]] || {
-      V_NAME=$(normalize_ref "$ref") V_DE="unknown" V_DM="unknown" V_SESSION="" V_APPLY="rpm-ostree" \
-        V_DESC="unknown image (not in the target table)" V_NOTES="" V_KEEP=""
-      add_warning "this image is not in the target table, so its desktop and display manager are unknown: the preflight reports what the running system has and the apply path is decided from policy.json alone."
-    }
+    usage >&2
+    die "an image address is required, e.g. '$PROG ghcr.io/wegweg7979/hurunagus-hyprland:latest'"
+  fi
+  if is_nvidia_ref "$ref"; then
+    err "NVIDIA images are not supported by this tool: $ref"
+    return 1
+  fi
+  if ! validate_ref "$ref"; then
+    usage_die "'$ref' is not an image address (registry/owner/name[:tag]). Names are not accepted — '$PROG --list' prints the addresses this tool knows."
+  fi
+  TARGET_REF=$(normalize_ref "$ref")
+  load_target_from_ref "$TARGET_REF"
+
+  if state_get ref >/dev/null 2>&1; then
+    have_state=1
+    want_ref=$(state_get ref || true)
+    want_step=$(state_get step || true)
+  fi
+  if ((have_state)) && [[ $want_ref != "$TARGET_REF" ]]; then
+    die "a rebase to '$want_ref' is in progress (step ${want_step:-?}). Finish it, run '$PROG --rollback', or re-run with that address."
   fi
 
   load_deployments
-  if ! inspect_target "$(normalize_ref "$ref")"; then
-    die "cannot resolve $ref (registry unreachable, wrong name, or a private image) — refusing to rebase blind."
+  booted_n=$(normalize_ref "$BOOTED_REF")
+
+  if ((have_state)) && [[ $booted_n == "$TARGET_REF" ]]; then
+    case "$want_step" in
+    1)
+      cmd_continue
+      return $?
+      ;;
+    2)
+      cmd_finish
+      return $?
+      ;;
+    *) die "unexpected state: step=$want_step" ;;
+    esac
   fi
-  preflight "$(normalize_ref "$ref")"
+  if ((have_state)) && [[ $booted_n != "$TARGET_REF" ]]; then
+    head2 "Waiting for a reboot"
+    info "the rebase to $TARGET_REF is staged; reboot and run this same command again"
+    info "  $PROG $TARGET_REF"
+    return 0
+  fi
+
+  if [[ $booted_n == "$TARGET_REF" ]]; then
+    say "You are already running $TARGET_REF."
+    if [[ $check == 1 ]]; then
+      say "Nothing to rebase. Drop --check to run the post-rebase fix checklist."
+      return 0
+    fi
+    if confirm "Run the post-rebase fix checklist for it?"; then
+      fix_checklist
+      return 0
+    fi
+    return 0
+  fi
+
+  if ! inspect_target "$TARGET_REF"; then
+    die "cannot resolve $TARGET_REF (registry unreachable, wrong name, or a private image) — refusing to rebase blind."
+  fi
+  preflight "$TARGET_REF"
   print_findings
 
   if [[ $check == 1 ]]; then
@@ -1230,11 +1477,10 @@ main() {
     say "Preflight only (--check): nothing was changed."
     return 0
   fi
-
   if ((${#REFUSALS[@]})); then
     die "refusing to rebase: see the refusals above."
   fi
-  do_apply "$(normalize_ref "$ref")"
+  do_apply "$TARGET_REF"
 }
 
 main "$@"

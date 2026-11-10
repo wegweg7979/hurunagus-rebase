@@ -195,6 +195,14 @@ if [[ ${1:-} == is-enabled ]]; then
   done
   exit 1
 fi
+if [[ ${1:-} == cat ]]; then
+  # unit_exists probe: pretend the unit is gone when listed in FAKE_DM_MISSING
+  unit=${2%.service}
+  for u in ${FAKE_DM_MISSING:-}; do
+    [[ $u == "$unit" ]] && exit 1
+  done
+  exit 0
+fi
 exit 0
 EOF
 
@@ -256,10 +264,18 @@ base_env() {
     FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-ublue.json"
     FAKE_DM_ENABLED="sddm"
     FAKE_SB="enabled"
+    XDG_RUNTIME_DIR="$SB/no-such-runtime-dir"
   )
   EXTRA=()
 }
 reset_state() { rm -f "$SB/varstate/state"; : >"$SB/log/fake.log"; }
+
+fresh_home() {
+  rm -rf "${SB:?}/home"
+  mkdir -p "$SB/home/b" "$SB/home/.config"
+  printf 'same\n' >"$SB/home/b/same.conf"
+  printf 'mine\n' >"$SB/home/b/diff.conf"
+}
 
 base_env
 
@@ -283,25 +299,71 @@ assert_not_contains "hyprland-dms"
 OUT=$OUT_SAVED
 assert_contains "Unsupported by design"
 
+t "a bare name is not a target: the address is"
+run hurunagus-ublue --check
+assert_rc 2
+assert_contains "is not an image address"
+assert_contains "--list"
+
+t "an address that is already the running image is recognised"
+run ghcr.io/wegweg7979/hurunagus-hyprland:latest --check
+assert_rc 0
+assert_contains "You are already running ghcr.io/wegweg7979/hurunagus-hyprland:latest"
+
+t "a rebase already in progress to a different address is refused"
+reset_state
+printf 'step=1\ntarget=hurunagus-ublue\nref=ghcr.io/wegweg7979/hurunagus-ublue:latest\n' >"$SB/varstate/state"
+run ghcr.io/ublue-os/aurora:latest --check
+assert_rc 1
+assert_contains "a rebase to 'ghcr.io/wegweg7979/hurunagus-ublue:latest' is in progress"
+reset_state
+
+t "the same command reports a staged rebase instead of rebasing again"
+printf 'step=1\ntarget=hurunagus-ublue\nref=ghcr.io/wegweg7979/hurunagus-ublue:latest\n' >"$SB/varstate/state"
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --yes
+assert_rc 0
+assert_contains "Waiting for a reboot"
+assert_contains "run this same command again"
+reset_state
+
+t "the same command after the reboot completes the signed half"
+printf 'step=1\ntarget=hurunagus-ublue\nref=ghcr.io/wegweg7979/hurunagus-ublue:latest\ndigest=sha256:bbbb1111\n' >"$SB/varstate/state"
+EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-ublue-unsigned.json")
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --yes
+assert_rc 0
+assert_logged "rpm-ostree rebase ostree-image-signed:docker://ghcr.io/wegweg7979/hurunagus-ublue:latest"
+grep -q '^step=2$' "$SB/varstate/state" && ok || bad "state should record step=2"
+EXTRA=()
+reset_state
+
+t "--list-refs prints exactly the known addresses, one per line"
+run --list-refs
+assert_rc 0
+[[ $(printf '%s\n' "$OUT" | wc -l) == 11 ]] && ok || bad "expected 11 addresses, got $(printf '%s\n' "$OUT" | wc -l)"
+assert_contains "ghcr.io/wegweg7979/hurunagus-hyprland:latest"
+assert_contains "ghcr.io/ublue-os/kinoite-main:latest"
+assert_not_contains "nvidia"
+assert_not_contains "TARGET"
+
 t "--help documents the dangerous flags"
 run --help
 assert_rc 0
 assert_contains "--adopt-differs"
 assert_contains "--fix-session"
-assert_contains "Refused by design: any *-nvidia* image."
+assert_contains "Refused by design: any *-nvidia* image"
 
 t "an nvidia image is refused, not warned about"
-run --image ghcr.io/ublue-os/bluefin-nvidia:latest --check
+run ghcr.io/ublue-os/bluefin-nvidia:latest --check
 assert_rc 1
 assert_contains "NVIDIA images are not supported"
 
 t "an nvidia image passed by name is refused before any registry call"
-run --image ghcr.io/zirconium-dev/zirconium-nvidia:latest --check
+run ghcr.io/zirconium-dev/zirconium-nvidia:latest --check
 assert_rc 1
 assert_contains "NVIDIA images are not supported"
 
 t "--check on a stale, older target plans the signed path and warns backwards + stale"
-run hurunagus-ublue --check
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --check
 assert_rc 0
 assert_contains "policy.json already permits ghcr.io/wegweg7979/hurunagus-ublue"
 assert_contains "moves the OS BACKWARDS"
@@ -312,7 +374,7 @@ assert_not_contains "hurubase --continue"
 
 t "--check on the flagship does not warn about a version change"
 EXTRA=(FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-flagship.json")
-run hurunagus-hyprland --check
+run ghcr.io/wegweg7979/hurunagus-hyprland:20261110 --check
 assert_rc 0
 assert_contains "Target"
 assert_not_contains "BACKWARDS"
@@ -321,55 +383,55 @@ EXTRA=()
 
 t "a staged deployment is refused"
 EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-staged.json")
-run hurunagus-ublue --check
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --check
 assert_rc 1
 assert_contains "a deployment is already staged"
 EXTRA=()
 
 t "not enough free space is refused"
 EXTRA=(FAKE_FREE_VAR_KB=1024)
-run hurunagus-ublue --check
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --check
 assert_rc 1
 assert_contains "at least 8192 MiB is required"
 EXTRA=()
 
 t "an unresolvable target is refused (fail closed)"
 EXTRA=(FAKE_SKOPEO_FAIL=1)
-run hurunagus-ublue --check
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --check
 assert_rc 1
 assert_contains "cannot resolve ghcr.io/wegweg7979/hurunagus-ublue:latest"
 EXTRA=()
 
 t "a strict policy forces the documented two-step"
 EXTRA=(HURUBASE_POLICY="$SB/fixtures/policy-strict.json")
-run hurunagus-ublue --check
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --check
 assert_rc 0
 assert_contains "the documented two-step is used"
-assert_contains "step 2  reboot, then 'hurubase --continue'"
+assert_contains "run the same command again"
 EXTRA=()
 
 t "an unknown image is accepted but flagged as unknown desktop"
-run --image ghcr.io/example/some-atomic:latest --check
+run ghcr.io/example/some-atomic:latest --check
 assert_rc 0
-assert_contains "not in the target table"
+assert_contains "this address is not one this tool knows"
 
 t "a target whose registry metadata carries no version label still plans cleanly"
 EXTRA=(FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-nolabels.json")
-run --image ghcr.io/zirconium-dev/zirconium:latest --check
+run ghcr.io/zirconium-dev/zirconium:latest --check
 assert_rc 0
 assert_contains "Preflight only (--check): nothing was changed."
 EXTRA=()
 
 t "an undeterminable free space is warned about, not silently skipped"
 EXTRA=(FAKE_FREE_VAR_KB=notanumber)
-run hurunagus-ublue --check
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --check
 assert_rc 0
 assert_contains "space guard did not run"
 EXTRA=()
 
 t "--dry-run prints the rebase command and writes no state"
 reset_state
-run hurunagus-ublue --dry-run --yes
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --dry-run --yes
 assert_rc 0
 assert_contains "rpm-ostree rebase ostree-image-signed:docker://ghcr.io/wegweg7979/hurunagus-ublue:latest"
 assert_contains "dry run: state not written"
@@ -378,7 +440,7 @@ assert_no_file "$SB/varstate/state"
 t "applying under a strict policy runs the unsigned first step and records step 1"
 reset_state
 EXTRA=(HURUBASE_POLICY="$SB/fixtures/policy-strict.json")
-run hurunagus-ublue --yes
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --yes
 assert_rc 0
 assert_logged "rpm-ostree rebase ostree-unverified-registry:ghcr.io/wegweg7979/hurunagus-ublue:latest"
 assert_contains "step 1"
@@ -391,7 +453,7 @@ t "--status reports the pending step"
 run --status
 assert_rc 0
 assert_contains "step    1"
-assert_contains "--continue"
+assert_contains "run the same command again"
 
 t "--continue refuses while the booted deployment is not the target"
 run --continue
@@ -431,107 +493,176 @@ reset_state
 printf 'step=2\ntarget=hurunagus-ublue\nref=ghcr.io/wegweg7979/hurunagus-ublue:latest\n' >"$SB/varstate/state"
 run --finish
 assert_rc 1
-assert_contains "not the recorded target"
+assert_contains "reboot into it first"
 
-t "--finish adopts missing files, leaves identical ones, reports differing ones, and honours the never-clobber list"
+t "the checklist writes missing files, leaves the never-clobber list alone, and reports differences"
+fresh_home
 reset_state
-printf 'step=2\ntarget=zirconium\nref=ghcr.io/zirconium-dev/zirconium:latest\ndigest=sha256:dddd3333\nsession=\n' >"$SB/varstate/state"
+printf 'step=2\ntarget=zirconium\nref=ghcr.io/zirconium-dev/zirconium:latest\ndigest=sha256:dddd3333\n' >"$SB/varstate/state"
 EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-zirconium.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-zirconium.json")
-run --finish
+printf 'n\nn\n' >"$SB/answers"
+EXTRA+=(HURUBASE_ANSWERS="$SB/answers")
+run ghcr.io/zirconium-dev/zirconium:latest
+assert_rc 0
+assert_contains "missing from"
+assert_contains "answered no (HURUBASE_ANSWERS line 1)"
+assert_no_file "$SB/home/a/new.conf"
+assert_contains "yours and different from the target"
+assert_no_file "$SB/home/.config/niri/local.kdl"
+assert_contains "never-clobber, always left alone: .config/niri/local.kdl"
+assert_contains "skipped 1 unsafe path(s)"
+EXTRA=()
+
+t "answering yes adopts the missing files and honours the never-clobber list"
+fresh_home
+reset_state
+printf 'step=2\ntarget=zirconium\nref=ghcr.io/zirconium-dev/zirconium:latest\ndigest=sha256:dddd3333\n' >"$SB/varstate/state"
+printf 'y\nn\n' >"$SB/answers"
+EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-zirconium.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-zirconium.json" HURUBASE_ANSWERS="$SB/answers")
+run ghcr.io/zirconium-dev/zirconium:latest
 assert_rc 0
 assert_file "$SB/home/a/new.conf"
 assert_is_link "$SB/home/link.conf" "/usr/share/backgrounds/hurunagus/leaf.jpg"
-assert_content "$SB/home/b/diff.conf" "mine"
 assert_no_file "$SB/home/.config/niri/local.kdl"
 assert_no_file "$SB/home/weird.name"
-assert_contains "already identical 1"
-assert_contains "differs, left alone: ~/b/diff.conf"
-assert_contains "kept (never-clobber): ~/.config/niri/local.kdl"
-assert_contains "skipping 'weird..name' (unsafe path)"
-assert_contains "re-run with --adopt-differs"
+assert_content "$SB/home/b/diff.conf" "mine"
+assert_contains "wrote 2, already identical 1, left alone (differ) 1"
 assert_no_file "$SB/varstate/state"
 EXTRA=()
 
-t "--finish --adopt-differs backs the file up before replacing it"
+t "saying yes to the differing files backs each one up before replacing it"
+fresh_home
 reset_state
 printf 'step=2\ntarget=zirconium\nref=ghcr.io/zirconium-dev/zirconium:latest\n' >"$SB/varstate/state"
-printf 'mine\n' >"$SB/home/b/diff.conf"
-EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-zirconium.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-zirconium.json")
-run --finish --adopt-differs
+printf 'n\ny\n' >"$SB/answers"
+EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-zirconium.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-zirconium.json" HURUBASE_ANSWERS="$SB/answers")
+run ghcr.io/zirconium-dev/zirconium:latest
 assert_rc 0
 assert_content "$SB/home/b/diff.conf" "stock"
 assert_glob_count "$SB/home/b/diff.conf.pre-rebase-*" 1
 assert_contains "replaced (backed up): ~/b/diff.conf"
 EXTRA=()
 
-t "--finish leaves nothing outside the target home and never deletes"
+t "--yes answers every fix prompt"
+fresh_home
+reset_state
+printf 'step=2\ntarget=zirconium\nref=ghcr.io/zirconium-dev/zirconium:latest\n' >"$SB/varstate/state"
+printf 'mine\n' >"$SB/home/b/diff.conf"
+EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-zirconium.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-zirconium.json")
+run ghcr.io/zirconium-dev/zirconium:latest --yes
+assert_rc 0
+assert_contains "auto-confirmed (--yes)"
+assert_content "$SB/home/b/diff.conf" "stock"
+assert_contains "replaced (backed up): ~/b/diff.conf"
+EXTRA=()
+
+t "--dry-run plans the fixes without changing anything"
+fresh_home
+reset_state
+printf 'step=2\ntarget=zirconium\nref=ghcr.io/zirconium-dev/zirconium:latest\n' >"$SB/varstate/state"
+EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-zirconium.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-zirconium.json")
+run ghcr.io/zirconium-dev/zirconium:latest --yes --dry-run
+assert_rc 0
+assert_contains "$ mkdir -p"
+assert_no_file "$SB/home/a/new.conf"
+assert_file "$SB/varstate/state"
+EXTRA=()
+
+t "the checklist never writes outside the target home"
+fresh_home
 reset_state
 printf 'step=2\ntarget=zirconium\nref=ghcr.io/zirconium-dev/zirconium:latest\n' >"$SB/varstate/state"
 skel_hash_before=$(find "$SB/skel" | sort | md5sum)
 EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-zirconium.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-zirconium.json")
-run --finish
+run ghcr.io/zirconium-dev/zirconium:latest --yes
 assert_rc 0
 skel_hash_after=$(find "$SB/skel" | sort | md5sum)
 [[ $skel_hash_before == "$skel_hash_after" ]] && ok || bad "/etc/skel was modified"
-assert_file "$SB/home/b/diff.conf"
 EXTRA=()
 
-t "--finish --fix-session rewrites a stale XSession and backs the record up"
+t "--no-adopt leaves $HOME completely alone"
+fresh_home
+reset_state
+printf 'step=2\ntarget=zirconium\nref=ghcr.io/zirconium-dev/zirconium:latest\n' >"$SB/varstate/state"
+printf 'mine\n' >"$SB/home/b/diff.conf"
+printf 'y\ny\n' >"$SB/answers"
+EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-zirconium.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-zirconium.json" HURUBASE_ANSWERS="$SB/answers")
+run ghcr.io/zirconium-dev/zirconium:latest --no-adopt
+assert_rc 0
+assert_contains "skipped --no-adopt"
+assert_content "$SB/home/b/diff.conf" "mine"
+EXTRA=()
+
+t "a stale recorded session is offered, and without root it is left for sudo"
 reset_state
 printf 'XSession=gnome\nSystemAccount=false\n' >"$SB/accounts/dan"
 printf 'step=2\ntarget=hurunagus-hyprland\nref=ghcr.io/wegweg7979/hurunagus-hyprland:latest\n' >"$SB/varstate/state"
-EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-hyprland.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-flagship.json")
-run --finish --fix-session --no-adopt
+EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-hyprland.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-flagship.json" HURUBASE_EUID=1000)
+printf 'n\nn\n' >"$SB/answers"
+run ghcr.io/wegweg7979/hurunagus-hyprland:latest --no-adopt
+assert_rc 0
+assert_contains "recorded session does not match 'hurunagus'"
+assert_contains "dan: XSession=gnome"
+assert_contains "re-run this same command with sudo"
+grep -q '^XSession=gnome$' "$SB/accounts/dan" && ok || bad "without root the record must not be rewritten"
+EXTRA=()
+
+t "with root and a yes, the stale session is reset and backed up"
+reset_state
+printf 'XSession=gnome\nSystemAccount=false\n' >"$SB/accounts/dan"
+printf 'step=2\ntarget=hurunagus-hyprland\nref=ghcr.io/wegweg7979/hurunagus-hyprland:latest\n' >"$SB/varstate/state"
+printf 'y\n' >"$SB/answers"
+EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-hyprland.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-flagship.json" HURUBASE_ANSWERS="$SB/answers")
+run ghcr.io/wegweg7979/hurunagus-hyprland:latest --no-adopt
 assert_rc 0
 grep -q '^XSession=hurunagus$' "$SB/accounts/dan" && ok || bad "XSession was not reset to hurunagus"
 assert_glob_count "$SB/accounts/dan.pre-rebase-*" 1
 assert_contains "set XSession=hurunagus"
 EXTRA=()
 
-t "--fix-session is reported (not applied) by a plain --finish"
+t "--fix-session resets without asking"
 reset_state
 printf 'XSession=gnome\nSystemAccount=false\n' >"$SB/accounts/dan"
 printf 'step=2\ntarget=hurunagus-hyprland\nref=ghcr.io/wegweg7979/hurunagus-hyprland:latest\n' >"$SB/varstate/state"
 EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-hyprland.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-flagship.json")
-run --finish
+run ghcr.io/wegweg7979/hurunagus-hyprland:latest --no-adopt --fix-session
 assert_rc 0
-assert_contains "recorded: dan: XSession=gnome"
-assert_contains "sudo hurubase --finish --fix-session"
-grep -q '^XSession=gnome$' "$SB/accounts/dan" && ok || bad "a plain --finish must not rewrite XSession"
+grep -q '^XSession=hurunagus$' "$SB/accounts/dan" && ok || bad "XSession was not reset"
 EXTRA=()
 
-t "--finish with no state and no target refuses"
+t "an unreadable AccountsService directory is reported, not assumed clean"
+fresh_home
 reset_state
-run --finish
-assert_rc 1
-assert_contains "no rebase state"
-
-t "--rollback refuses without root"
-reset_state
-EXTRA=(HURUBASE_EUID=1000)
-run --rollback --yes
-assert_rc 1
-assert_contains "rollback needs root"
+printf 'step=2\ntarget=hurunagus-hyprland\nref=ghcr.io/wegweg7979/hurunagus-hyprland:latest\n' >"$SB/varstate/state"
+EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-hyprland.json" FAKE_SKOPEO_JSON="$SB/fixtures/skopeo-flagship.json" HURUBASE_ACCOUNTS_DIR="$SB/no-such-accounts")
+run ghcr.io/wegweg7979/hurunagus-hyprland:latest --no-adopt
+assert_rc 0
+assert_contains "cannot read"
+assert_contains "re-run with sudo to check it"
 EXTRA=()
 
-t "--rollback asks and runs rpm-ostree rollback"
+t "an enabled display manager the target does not ship is offered, and disabled with a yes"
 reset_state
-: >"$SB/log/fake.log"
-run --rollback --yes
+printf 'step=2\ntarget=hurunagus-ublue\nref=ghcr.io/wegweg7979/hurunagus-ublue:latest\n' >"$SB/varstate/state"
+printf 'y\nn\n' >"$SB/answers"
+EXTRA=(FAKE_OSTREE_JSON="$SB/fixtures/ostree-booted-ublue-signed.json" FAKE_DM_ENABLED="sddm greetd" FAKE_DM_MISSING="sddm" HURUBASE_ANSWERS="$SB/answers")
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --no-adopt
 assert_rc 0
-assert_logged "rpm-ostree rollback"
+assert_contains "sddm.service is still enabled in /etc but the target does not ship it"
+assert_logged "systemctl disable sddm.service"
+EXTRA=()
 
 t "applying without root is refused"
 reset_state
 EXTRA=(HURUBASE_EUID=1000)
-run hurunagus-ublue --yes
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --yes
 assert_rc 1
 assert_contains "needs root"
 EXTRA=()
 
 t "an unreadable policy falls back to the two-step instead of assuming trust"
 EXTRA=(HURUBASE_POLICY="$SB/fixtures/nope.json")
-run hurunagus-ublue --check
+run ghcr.io/wegweg7979/hurunagus-ublue:latest --check
 assert_rc 0
 assert_contains "no-policy-file"
 EXTRA=()

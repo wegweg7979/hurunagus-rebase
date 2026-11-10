@@ -43,17 +43,22 @@ jobs:
           head -n1 hurubase | grep -qx '#!/usr/bin/env bash' ||
             { echo "::error file=hurubase::expected the bash shebang, got: $(head -n1 hurubase)"; exit 1; }
 
-      - name: README target table matches --list
+      - name: every known address is documented
         run: |
           set -euo pipefail
           rc=0
-          # Table region only: everything before the first blank line, minus the header row.
-          while read -r name _; do
-            [[ -n $name ]] || continue
-            pat=$(printf '`%s`' "$name")
+          # --list-refs, not --list: the human table puts spaces inside the desktop
+          # column, so splitting it by whitespace silently reads the wrong fields.
+          count=0
+          while read -r address; do
+            [[ -n $address ]] || continue
+            count=$((count + 1))
+            pat=$(printf '`%s`' "$address")
             grep -qF "$pat" README.md ||
-              { echo "::error file=README.md::README does not list the target '$name'"; rc=1; }
-          done < <(./hurubase --list | sed -n '1,/^$/p' | tail -n +2)
+              { echo "::error file=README.md::README does not list the address '$address'"; rc=1; }
+          done < <(./hurubase --list-refs)
+          [[ $count -gt 0 ]] || { echo "::error::--list-refs printed nothing"; rc=1; }
+          echo "checked $count addresses"
           exit "$rc"
 
       - name: the CLI answers without a system to inspect
