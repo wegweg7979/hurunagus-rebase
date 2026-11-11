@@ -29,17 +29,3 @@ Deletes anything. Prunes a deployment. Edits `/etc/containers/policy.json` or
 any other system file. Writes outside `$HOME` during the checklist. Reboots
 without asking. Proceeds past a refusal.
 
-## Tests
-
-```sh
-test/hurubase-test.sh    # 133 checks; fake rpm-ostree/bootc/skopeo/systemctl/df,
-                         # a fixture /etc, $HOME and /etc/skel — nothing real is touched
-```
-
-GitHub Actions runs the same suite on `ubuntu-24.04`, plus `bash -n`, shellcheck
-(warning and up) on both scripts, the executable bit and shebang, and a check
-that this README lists every address `--list` knows about.
-
-Every environment seam — fixtures, command paths, scripted prompt answers
-(`HURUBASE_ANSWERS`), dry-run, root gate — is documented in the header of
-`hurubase`.
