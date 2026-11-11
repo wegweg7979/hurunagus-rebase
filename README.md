@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/wegweg7979/hurunagus-rebase/actions/workflows/ci.yml/badge.svg)](https://github.com/wegweg7979/hurunagus-rebase/actions/workflows/ci.yml)
 
-<img width="512" height="512" alt="Gemini_Generated_Image_rokat0rokat0roka" src="https://github.com/user-attachments/assets/89a83c6b-c4f1-4b26-ba06-a7ad6bc40cfb" />
+<img width="128" height="128" alt="Gemini_Generated_Image_rokat0rokat0roka" src="https://github.com/user-attachments/assets/89a83c6b-c4f1-4b26-ba06-a7ad6bc40cfb" />
 
 
 A safe rebase helper for [hurunagus](https://github.com/wegweg7979) images and
